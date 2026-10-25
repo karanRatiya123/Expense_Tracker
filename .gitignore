@@ -20,6 +20,12 @@ vendor/
 .DS_Store
 Thumbs.db
 
+# Local-only material
+college/
+__pycache__/
+*.pyc
+*.docx
+
 # XAMPP / htdocs
 */xampp*
 /xampp/

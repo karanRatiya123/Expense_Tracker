@@ -1,3 +1,5 @@
+-- ApexSpend single-database installation.
+-- This file is the complete schema and seed data for the application.
 CREATE DATABASE IF NOT EXISTS apexspend_db;
 USE apexspend_db;
 
