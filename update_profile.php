@@ -1,8 +1,9 @@
 <?php
 /**
  * ApexSpend — Profile update handler
- * POST-only. Two actions: update_info, change_password.
- * Writes to MySQL when available, falls back to $_SESSION['users_db'] (same pattern as auth.php).
+ * POST-only. Actions: update_info, change_password, update_goals.
+ * MySQL-backed — when the DB is unreachable the request fails with a clear
+ * flash (there is no in-session fallback store; see config.php).
  */
 require_once 'config.php';
 require_once 'includes/mailer.php';
@@ -14,45 +15,26 @@ if ($_SERVER['REQUEST_METHOD'] !== 'POST' || !isset($_SESSION['user'])) {
 
 csrf_validate();
 
-$action = $_POST['action'] ?? '';
-$userId = (int) $_SESSION['user']['id'];
 $pdo = getDBConnection();
-
-// Small helper to apply a row update in either storage backend.
-function apply_user_update($pdo, $userId, $fields) {
-    if ($pdo) {
-        $sets = [];
-        $vals = [];
-        foreach ($fields as $col => $val) {
-            $sets[] = "$col = ?";
-            $vals[] = $val;
-        }
-        $vals[] = $userId;
-        $sql = 'UPDATE users SET ' . implode(', ', $sets) . ' WHERE id = ?';
-        $stmt = $pdo->prepare($sql);
-        $stmt->execute($vals);
-    } else {
-        foreach ($_SESSION['users_db'] as &$u) {
-            if ((int) $u['id'] === $userId) {
-                foreach ($fields as $col => $val) $u[$col] = $val;
-                break;
-            }
-        }
-        unset($u);
-    }
+if (!$pdo) {
+    $_SESSION['flash_error'] = 'The database is unreachable right now. Please try again shortly.';
+    header('Location: login.php');
+    exit;
 }
 
-function fetch_user_hash($pdo, $userId) {
-    if ($pdo) {
-        $stmt = $pdo->prepare('SELECT password FROM users WHERE id = ?');
-        $stmt->execute([$userId]);
-        $row = $stmt->fetch();
-        return $row ? $row['password'] : null;
+$action = $_POST['action'] ?? '';
+$userId = (int) $_SESSION['user']['id'];
+
+/** Apply a whitelisted-column row update on users. Columns are hard-coded per action, never from input. */
+function apply_user_update(PDO $pdo, int $userId, array $fields): void {
+    $sets = [];
+    $vals = [];
+    foreach ($fields as $col => $val) {
+        $sets[] = "$col = ?";
+        $vals[] = $val;
     }
-    foreach ($_SESSION['users_db'] as $u) {
-        if ((int) $u['id'] === $userId) return $u['password'];
-    }
-    return null;
+    $vals[] = $userId;
+    $pdo->prepare('UPDATE users SET ' . implode(', ', $sets) . ' WHERE id = ?')->execute($vals);
 }
 
 // ---- UPDATE NAME / EMAIL ----
@@ -60,34 +42,26 @@ if ($action === 'update_info') {
     $name = trim($_POST['name'] ?? '');
     $email = trim(strtolower($_POST['email'] ?? ''));
 
-    if ($name === '' || $email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
-        $_SESSION['flash_error'] = 'Name and a valid email are required.';
+    if ($name === '' || $email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL) || mb_strlen($name) > 100) {
+        $_SESSION['flash_error'] = 'Name (max 100 chars) and a valid email are required.';
         header('Location: profile.php');
         exit;
     }
 
     // Block duplicate email (someone else's)
-    if ($pdo) {
-        $stmt = $pdo->prepare('SELECT id FROM users WHERE email = ? AND id <> ?');
-        $stmt->execute([$email, $userId]);
-        if ($stmt->fetch()) {
-            $_SESSION['flash_error'] = 'That email is already in use.';
-            header('Location: profile.php');
-            exit;
-        }
-    } else {
-        foreach ($_SESSION['users_db'] as $u) {
-            if ((int) $u['id'] !== $userId && strtolower($u['email']) === $email) {
-                $_SESSION['flash_error'] = 'That email is already in use.';
-                header('Location: profile.php');
-                exit;
-            }
-        }
+    $stmt = $pdo->prepare('SELECT id FROM users WHERE email = ? AND id <> ?');
+    $stmt->execute([$email, $userId]);
+    if ($stmt->fetch()) {
+        $_SESSION['flash_error'] = 'That email is already in use.';
+        header('Location: profile.php');
+        exit;
     }
 
     apply_user_update($pdo, $userId, ['name' => $name, 'email' => $email]);
     $_SESSION['user']['name'] = $name;
     $_SESSION['user']['email'] = $email;
+    // Identity changed for this user: fresh session id, same session data.
+    session_regenerate_id(true);
     $_SESSION['flash_success'] = 'Profile updated.';
 
     header('Location: profile.php');
@@ -107,8 +81,10 @@ if ($action === 'change_password') {
         exit;
     }
 
-    $hash = fetch_user_hash($pdo, $userId);
-    if (!$hash || !password_verify($old, $hash)) {
+    $stmt = $pdo->prepare('SELECT password FROM users WHERE id = ?');
+    $stmt->execute([$userId]);
+    $hash = $stmt->fetchColumn();
+    if (!$hash || !password_verify($old, (string) $hash)) {
         $_SESSION['flash_error'] = 'Current password is incorrect.';
         header('Location: profile.php');
         exit;
@@ -116,51 +92,30 @@ if ($action === 'change_password') {
 
     $newHash = password_hash($new, PASSWORD_BCRYPT);
     apply_user_update($pdo, $userId, ['password' => $newHash]);
+    // A password change invalidates old credentials anywhere: refresh the
+    // session id so a stolen pre-change session cookie no longer matches.
+    session_regenerate_id(true);
     $_SESSION['flash_success'] = 'Password changed.';
 
     header('Location: profile.php');
-    defer_notification_email('password_changed');
+    defer_notification_email('password_changed', []);
     exit;
 }
 
 // ---- UPDATE GOALS ----
 if ($action === 'update_goals') {
-    $savings_goal = floatval($_POST['savings_goal'] ?? 0);
-    $run_rate_target = floatval($_POST['run_rate_target'] ?? 0);
+    $savings_goal = money_amount($_POST['savings_goal'] ?? 0);
+    $run_rate_target = money_amount($_POST['run_rate_target'] ?? 0);
 
     if ($savings_goal <= 0 || $run_rate_target <= 0) {
-        $_SESSION['flash_error'] = 'Goals must be positive numbers.';
+        $_SESSION['flash_error'] = 'Goals must be positive numbers (max 99,999,999.99).';
         header('Location: profile.php');
         exit;
     }
 
-    if ($pdo) {
-        // Ensure columns exist (safeguard)
-        try {
-            $pdo->query("SELECT savings_goal, run_rate_target FROM users LIMIT 1");
-        } catch (PDOException $e) {
-            try {
-                $pdo->exec("ALTER TABLE users ADD COLUMN savings_goal DECIMAL(15,2) DEFAULT 50000.00");
-                $pdo->exec("ALTER TABLE users ADD COLUMN run_rate_target DECIMAL(15,2) DEFAULT 1000000.00");
-            } catch (PDOException $e2) {}
-        }
-
-        apply_user_update($pdo, $userId, ['savings_goal' => $savings_goal, 'run_rate_target' => $run_rate_target]);
-    }
-
+    apply_user_update($pdo, $userId, ['savings_goal' => $savings_goal, 'run_rate_target' => $run_rate_target]);
     $_SESSION['user']['savings_goal'] = $savings_goal;
     $_SESSION['user']['run_rate_target'] = $run_rate_target;
-
-    if (isset($_SESSION['users_db'])) {
-        foreach ($_SESSION['users_db'] as &$u) {
-            if ((int)$u['id'] === $userId) {
-                $u['savings_goal'] = $savings_goal;
-                $u['run_rate_target'] = $run_rate_target;
-                break;
-            }
-        }
-        unset($u);
-    }
 
     $_SESSION['flash_success'] = 'Financial goals updated.';
     header('Location: profile.php');

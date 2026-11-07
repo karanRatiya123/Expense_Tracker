@@ -1,0 +1,14 @@
+# ApexSpend — keep internals out of the browser.
+# These paths are read by PHP include/require (filesystem), never by HTTP.
+<IfModule mod_authz_core.c>
+    # Internal folders: no direct browsing.
+    RedirectMatch 403 (includes|vendor|college|\.agentsroom|\.git|\.sessions)(/|$)
+</IfModule>
+
+# Sensitive individual files that should never be served.
+<FilesMatch "^(composer\.(json|lock|phar)|database\.sql|mail_credentials\.php|config\.php|\.htaccess$)">
+    Require all denied
+</FilesMatch>
+
+# Do not list the directory anywhere.
+Options -Indexes

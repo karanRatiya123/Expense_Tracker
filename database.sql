@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS transactions (
     category VARCHAR(100) NOT NULL,
     date DATETIME NOT NULL,
     method VARCHAR(100),
+    INDEX idx_user_date (user_id, date),
+    INDEX idx_user_category (user_id, category),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
 
@@ -42,8 +44,30 @@ CREATE TABLE IF NOT EXISTS budgets (
     end_date DATE,
     thresholds JSON,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_user_category (user_id, category),
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- ============================================================
+--  login_attempts — brute-force throttle written by auth.php
+--  (includes/login_guard.php). Five failures inside a 15-minute
+--  window block that email+IP until the window passes.
+-- ============================================================
+CREATE TABLE IF NOT EXISTS login_attempts (
+    email VARCHAR(100) NOT NULL,
+    ip VARCHAR(45) NOT NULL DEFAULT '',
+    attempts INT NOT NULL DEFAULT 0,
+    window_start DATETIME NOT NULL,
+    PRIMARY KEY (email, ip)
+);
+
+-- ============================================================
+--  EXISTING INSTALLS: the transaction/budget indexes above can be
+--  added to a live database without touching data:
+--    ALTER TABLE transactions ADD INDEX idx_user_date (user_id, date);
+--    ALTER TABLE transactions ADD INDEX idx_user_category (user_id, category);
+--    ALTER TABLE budgets ADD INDEX idx_user_category (user_id, category);
+-- ============================================================
 
 -- ============================================================
 --  Family Space — added later, additive only (no change to
@@ -103,10 +127,9 @@ SELECT 'cat_seed_health',  u.id, 'Health & Medical',    'fa-briefcase-medical', 
 INSERT IGNORE INTO categories (id, user_id, name, icon, color, is_builtin, position)
 SELECT 'cat_seed_income',  u.id, 'Income',              'fa-money-bill-wave',   '#8a8a8a', 1, 7 FROM users u ORDER BY u.id LIMIT 1;
 
--- Insert demo user
+-- Insert demo user (demo@apexspend.com / password123)
 INSERT IGNORE INTO users (id, name, email, password, created_at) VALUES 
-(1, 'Alex Morgan', 'demo@apexspend.com', '$2y$10$92IXUNpkjO0rOQ5byMi.Ye4oKoEa3Ro9llC/.og/at2.uheWG/igi', '2026-07-28 10:00:00');
--- The password hash is for 'password123' generated using BCRYPT. (from config.php)
+(1, 'Alex Morgan', 'demo@apexspend.com', '$2y$10$CbxJ6QzJeq5X2pixzmgNveQZYBsL4RmkjZeYsKPv2wsrtp0WwU4uW', '2026-07-28 10:00:00');
 
 -- Insert demo transactions
 INSERT IGNORE INTO transactions (id, user_id, type, title, note, amount, category, date, method) VALUES 

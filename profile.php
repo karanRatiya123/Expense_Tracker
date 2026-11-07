@@ -8,52 +8,34 @@ if (!isset($_SESSION['user'])) {
 }
 
 $pdo = getDBConnection();
+if (!$pdo) {
+    // Single storage mode: no MySQL, no app. Fail loudly instead of
+    // pretending the data is what it is not.
+    http_response_code(503);
+    $_SESSION['flash_error'] = 'The database is unreachable right now. Please try again shortly.';
+    header('Location: login.php');
+    exit;
+}
 $userId = (int) $_SESSION['user']['id'];
 $user = $_SESSION['user'];
 $activePage = 'profile';
 
-// Hydrate full record (DB has created_at + avatar_path; session store is the source in fallback).
-if ($pdo) {
-    // Ensure columns exist (safeguard)
-    try {
-        $pdo->query("SELECT savings_goal, run_rate_target FROM users LIMIT 1");
-    } catch (PDOException $e) {
-        try {
-            $pdo->exec("ALTER TABLE users ADD COLUMN savings_goal DECIMAL(15,2) DEFAULT 50000.00");
-            $pdo->exec("ALTER TABLE users ADD COLUMN run_rate_target DECIMAL(15,2) DEFAULT 1000000.00");
-        } catch (PDOException $e2) {}
-    }
+// Hydrate the full record (DB carries created_at, avatar_path, goals).
+$stmt = $pdo->prepare('SELECT id, name, email, avatar_path, savings_goal, run_rate_target, created_at FROM users WHERE id = ?');
+$stmt->execute([$userId]);
+if ($row = $stmt->fetch()) $user = array_merge($user, $row);
 
-    $stmt = $pdo->prepare('SELECT id, name, email, avatar_path, savings_goal, run_rate_target, created_at FROM users WHERE id = ?');
-    $stmt->execute([$userId]);
-    if ($row = $stmt->fetch()) $user = array_merge($user, $row);
-
-    $txCount = (int) $pdo->query("SELECT COUNT(*) FROM transactions WHERE user_id = $userId")->fetchColumn();
-    $budgetCount = (int) $pdo->query("SELECT COUNT(*) FROM budgets WHERE user_id = $userId")->fetchColumn();
-} else {
-    foreach ($_SESSION['users_db'] as $u) {
-        if ((int) $u['id'] === $userId) {
-            if (!isset($u['created_at'])) $u['created_at'] = date('Y-m-d H:i:s');
-            if (!isset($u['avatar_path'])) $u['avatar_path'] = null;
-            if (!isset($u['savings_goal'])) $u['savings_goal'] = 50000.00;
-            if (!isset($u['run_rate_target'])) $u['run_rate_target'] = 1000000.00;
-            $user = array_merge($user, $u);
-            break;
-        }
-    }
-    $txCount = 6;       // matches the seeded ledger rows
-    $budgetCount = 5;   // matches the seeded budget categories
-}
+$txStmt = $pdo->prepare('SELECT COUNT(*) FROM transactions WHERE user_id = ?');
+$txStmt->execute([$userId]);
+$txCount = (int) $txStmt->fetchColumn();
+$bgStmt = $pdo->prepare('SELECT COUNT(*) FROM budgets WHERE user_id = ?');
+$bgStmt->execute([$userId]);
+$budgetCount = (int) $bgStmt->fetchColumn();
 
 $savings_goal = isset($user['savings_goal']) ? (float)$user['savings_goal'] : 50000.00;
 $run_rate_target = isset($user['run_rate_target']) ? (float)$user['run_rate_target'] : 1000000.00;
 
-$emailNotif = 1;
-if ($pdo) {
-    $emailNotif = email_notifications_enabled($pdo, $userId) ? 1 : 0;
-} else {
-    $emailNotif = isset($user['email_notifications']) ? (int) $user['email_notifications'] : 1;
-}
+$emailNotif = email_notifications_enabled($pdo, $userId) ? 1 : 0;
 $_SESSION['user']['email_notifications'] = $emailNotif;
 
 $initials = strtoupper(substr($user['name'], 0, 1));
