@@ -9,6 +9,7 @@ Screenshot 2026-07-28 200114.png
 *.log
 *.bak
 *.tmp
+.tmp_*
 .sessions/
 composer.phar
 mail_credentials.php
@@ -25,7 +26,10 @@ college/
 __pycache__/
 *.pyc
 *.docx
+generate_*_docx.py
 
 # XAMPP / htdocs
 */xampp*
 /xampp/
+.mcp.json
+.agentsroom/

@@ -1,18 +1,24 @@
 <?php
 /**
- * ApexSpend - Configuration & Database Helper
+ * ApexSpend — Configuration & Database Helper
  */
 
 if (session_status() === PHP_SESSION_NONE) {
     $sessionPath = __DIR__ . DIRECTORY_SEPARATOR . '.sessions';
     if (!is_dir($sessionPath)) {
-        mkdir($sessionPath, 0775, true);
+        @mkdir($sessionPath, 0775, true);
     }
-    if (is_writable($sessionPath)) {
-        session_save_path($sessionPath);
+    // Session files under htdocs must never be web-readable. Apache lets the
+    // folder be listed; this guard drops any direct request to the files.
+    $sessionGuard = $sessionPath . DIRECTORY_SEPARATOR . '.htaccess';
+    if (is_dir($sessionPath) && !is_file($sessionGuard)) {
+        @file_put_contents($sessionGuard, "Require all denied\n");
     }
+    @session_save_path($sessionPath);
     session_set_cookie_params([
         'httponly' => true,
+        // secure=on once the site is served over HTTPS (no effect on plain HTTP)
+        'secure'   => !empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off',
         'samesite' => 'Lax',
         'path'     => '/',
     ]);
@@ -20,6 +26,15 @@ if (session_status() === PHP_SESSION_NONE) {
 }
 
 define('CSRF_FIELD', '_token');
+
+/**
+ * Standard JSON response: set the status code, print, stop.
+ */
+function json_out(array $data, int $status = 200): never {
+    http_response_code($status);
+    echo json_encode($data);
+    exit;
+}
 
 /**
  * Return the per-session CSRF token, minting one if missing.
@@ -40,22 +55,49 @@ function csrf_token(): string {
  */
 function csrf_validate(): void {
     $sent = $_POST[CSRF_FIELD] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '');
-    if (!isset($_SESSION['csrf_token']) || !hash_equals($_SESSION['csrf_token'], (string) $sent)) {
-        http_response_code(403);
-        $isAjax = str_starts_with($_SERVER['REQUEST_URI'] ?? '', '/api_')
-            || (isset($_SERVER['HTTP_X_REQUESTED_WITH']) && strtolower($_SERVER['HTTP_X_REQUESTED_WITH']) === 'xmlhttprequest');
-        header('Content-Type: application/json');
-        echo json_encode(['success' => false, 'error' => 'Invalid CSRF token']);
-        // The header above is fine for AJAX; for plain forms we also want a redirect:
-        if (!$isAjax) {
-            $_SESSION['flash_error'] = 'Session expired. Please try again.';
-            header('Location: ' . ($_SERVER['HTTP_REFERER'] ?? 'login.php'));
-        }
-        exit;
+    if (isset($_SESSION['csrf_token']) && hash_equals($_SESSION['csrf_token'], (string) $sent)) {
+        return;
     }
+    // Distinguish API handlers from plain form handlers by script name,
+    // not by URL prefix (REQUEST_URI includes htdocs subdirectories).
+    $script = basename($_SERVER['SCRIPT_NAME'] ?? '');
+    if (str_starts_with($script, 'api_')) {
+        json_out(['success' => false, 'error' => 'Invalid CSRF token'], 403);
+    }
+    $_SESSION['flash_error'] = 'Session expired. Please try again.';
+    header('Location: ' . ($_SERVER['HTTP_REFERER'] ?? '../pages/login.php'));
+    exit;
 }
 
-// Database Credentials (Customize for your MySQL setup)
+/**
+ * Gate for api_*.php endpoints. Order: headers, session, (method, CSRF), DB.
+ * 'write' = POST + CSRF (+DB). 'read' = session (+DB) only.
+ * Returns [userArray, PDO] and exits with the proper HTTP status on failure.
+ * When $dbRequired is false the caller decides how to handle null PDO.
+ * @param 'write'|'read' $mode
+ * @return array{0: array, 1: PDO|null}
+ */
+function api_gate(string $mode, bool $dbRequired = true): array {
+    header('Content-Type: application/json; charset=utf-8');
+    header('X-Content-Type-Options: nosniff');
+
+    if (!isset($_SESSION['user'])) {
+        json_out(['success' => false, 'error' => 'Unauthorized'], 401);
+    }
+    if ($mode === 'write') {
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            json_out(['success' => false, 'error' => 'Invalid request'], 405);
+        }
+        csrf_validate();
+    }
+    $pdo = getDBConnection();
+    if ($dbRequired && !$pdo) {
+        json_out(['success' => false, 'error' => 'Database connection failed'], 503);
+    }
+    return [$_SESSION['user'], $pdo];
+}
+
+// ─── Database Credentials (Customize for your MySQL setup) ────────
 define('DB_HOST', 'localhost');
 define('DB_USER', 'root');
 define('DB_PASS', '');
@@ -82,7 +124,9 @@ if (!defined('MAIL_TIMEOUT'))  define('MAIL_TIMEOUT', 8); // seconds — stops a
 
 /**
  * Get Database Connection (PDO)
- * Falls back gracefully if MySQL is not available yet
+ * Returns null when MySQL is unreachable. API handlers answer 503 via
+ * api_gate(); page handlers show their own flash — there is no fallback
+ * store: data must not silently disappear when the DB is down.
  */
 function getDBConnection() {
     // One connection per request — avoids paying for (and holding) extra
@@ -101,24 +145,30 @@ function getDBConnection() {
         ]);
         return $pdo;
     } catch (PDOException $e) {
-        $pdo = null;
-        return null; // Null fallback triggers Session Storage Mode for quick testing
+        error_log('ApexSpend DB: connection failed — ' . $e->getMessage());
+        return null;
     }
 }
 
 /**
- * Initialize Demo User in Session if not using DB
+ * Clamped monetary amount. Returns 0.0 when the input is not a valid
+ * positive amount (caller treats 0 as invalid). Max guards DECIMAL(15,2).
  */
-if (!isset($_SESSION['users_db'])) {
-    $_SESSION['users_db'] = [
-        [
-            'id' => 1,
-            'name' => 'Alex Morgan',
-            'email' => 'demo@apexspend.com',
-            'password' => password_hash('password123', PASSWORD_BCRYPT),
-            'created_at' => date('Y-m-d H:i:s')
-        ]
-    ];
+function money_amount(mixed $raw, float $max = 99999999.99): float {
+    $value = round((float) $raw, 2);
+    if ($value <= 0.0 || $value > $max) {
+        return 0.0;
+    }
+    return $value;
+}
+
+/**
+ * Collision-proof, unpredictable record id: prefix + 20 hex chars.
+ * (uniqid() was microsecond-timestamp based — predictable and, on a very
+ * busy second, collision-prone.)
+ */
+function apex_id(string $prefix): string {
+    return $prefix . '_' . bin2hex(random_bytes(10));
 }
 
 /**

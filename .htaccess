@@ -2,7 +2,7 @@
 # These paths are read by PHP include/require (filesystem), never by HTTP.
 <IfModule mod_authz_core.c>
     # Internal folders: no direct browsing.
-    RedirectMatch 403 (includes|vendor|college|\.agentsroom|\.git|\.sessions)(/|$)
+    RedirectMatch 403 (includes|database|tests|docs|vendor|college|\.agentsroom|\.git|\.sessions)(/|$)
 </IfModule>
 
 # Sensitive individual files that should never be served.
